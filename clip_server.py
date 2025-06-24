@@ -7,7 +7,7 @@ import logging
 import time
 from PIL import Image
 from io import BytesIO
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, send_file
 from flask_cors import CORS
 from transformers import CLIPModel, CLIPProcessor
 from tqdm import tqdm
@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 class ImageSearchServer:
     def __init__(self, model_name="openai/clip-vit-base-patch32"):
         self.device = "cpu"  # macOS x86_64, no MPS
+        self.model_name = model_name
         self.model, self.processor = self.load_clip_model(model_name)
         self.embedding_dim = 512
         self.index = faiss.IndexFlatIP(self.embedding_dim)
@@ -36,8 +37,18 @@ class ImageSearchServer:
 
     def load_clip_model(self, model_name):
         logger.info(f"Loading CLIP model: {model_name}")
-        model = CLIPModel.from_pretrained(model_name).to(self.device)
-        processor = CLIPProcessor.from_pretrained(model_name)
+        try:
+            # Try to load from cache first (Docker environment)
+            model = CLIPModel.from_pretrained(model_name, local_files_only=False).to(self.device)
+            processor = CLIPProcessor.from_pretrained(model_name, local_files_only=False)
+            logger.info("Model loaded successfully from cache/download")
+        except Exception as e:
+            logger.warning(f"Failed to load model with cache preference: {e}")
+            logger.info("Downloading model from HuggingFace...")
+            # Fallback to normal loading (will download if needed)
+            model = CLIPModel.from_pretrained(model_name).to(self.device)
+            processor = CLIPProcessor.from_pretrained(model_name)
+            logger.info("Model downloaded and loaded successfully")
         return model, processor
 
     def get_image_embedding(self, image_data, image_type):
@@ -139,6 +150,32 @@ class ImageSearchServer:
         time.sleep(1)
         yield f"data: {json.dumps({'progress': 100, 'status': 'completed'})}\n\n"
 
+@app.route("/index.html", methods=["GET"])
+def serve_index():
+    try:
+        return send_file("./index.html", mimetype='text/html')
+    except FileNotFoundError:
+        return jsonify({"error": "index.html not found"}), 404
+    except Exception as e:
+        logger.error(f"Error serving index.html: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/db/<path:filename>", methods=["GET"])
+def serve_db_file(filename):
+    try:
+        file_path = os.path.join("./db", filename)
+        if not os.path.exists(file_path):
+            return jsonify({"error": f"File {filename} not found"}), 404
+        
+        # Security check: ensure the file is within the db directory
+        if not os.path.abspath(file_path).startswith(os.path.abspath("./db")):
+            return jsonify({"error": "Access denied"}), 403
+            
+        return send_file(file_path)
+    except Exception as e:
+        logger.error(f"Error serving db file {filename}: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/status", methods=["GET"])
 def status():
     return jsonify(server.status), 200
@@ -222,16 +259,20 @@ def query():
         logger.error(f"Error processing query for {text}: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route("/similar", methods=["GET"])
+@app.route("/similar", methods=["POST"])
 def similar():
-    image_path = request.args.get("image_path")
-    top_k = int(request.args.get("top_k", 5))
-    if not image_path or not os.path.exists(image_path):
-        return jsonify({"error": "Invalid or missing image_path"}), 400
+    if not request.data:
+        return jsonify({"error": "No image data provided"}), 400
+    
+    image_data = request.data
+    image_type = request.headers.get("Content-Type", "").split("/")[-1].lower()
+    top_k = int(request.form.get("top_k", 5)) if request.form.get("top_k") else int(request.args.get("top_k", 5))
+    
+    if not image_type in {"jpg", "jpeg", "png"}:
+        return jsonify({"error": "Invalid image type. Supported: jpg, jpeg, png"}), 400
+    
     try:
-        with open(image_path, "rb") as f:
-            image_data = f.read()
-        image_embedding = server.get_image_embedding(image_data, os.path.splitext(image_path)[1].lower()).astype(np.float32)
+        image_embedding = server.get_image_embedding(image_data, image_type).astype(np.float32)
         distances, indices = server.index.search(np.array([image_embedding]), top_k)
         results = []
         for idx, score in zip(indices[0], distances[0]):
@@ -242,10 +283,10 @@ def similar():
                     "imageSize": meta["imageSize"],
                     "score": float(score * 100)
                 })
-        logger.info(f"Queried similar images for {image_path}, found {len(results)} matches")
-        return jsonify({"image_path": image_path, "results": results}), 200
+        logger.info(f"Queried similar images with uploaded image, found {len(results)} matches")
+        return jsonify({"results": results}), 200
     except Exception as e:
-        logger.error(f"Error processing similar query for {image_path}: {e}")
+        logger.error(f"Error processing similar query with uploaded image: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/delete", methods=["GET"])
@@ -276,4 +317,3 @@ if __name__ == "__main__":
     logger.info("Starting Image Search Server")
     server = ImageSearchServer()
     app.run(host="0.0.0.0", port=5000)
-    

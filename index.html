@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>CLIP Image Search Client</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                padding: 20px;
+            }
+            
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+                background: white;
+                border-radius: 15px;
+                box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                overflow: hidden;
+            }
+            
+            .header {
+                background: linear-gradient(45deg, #667eea, #764ba2);
+                color: white;
+                padding: 30px;
+                text-align: center;
+            }
+            
+            .header h1 {
+                font-size: 2.5em;
+                margin-bottom: 10px;
+            }
+            
+            .header p {
+                opacity: 0.9;
+                font-size: 1.1em;
+            }
+            
+            .content {
+                padding: 30px;
+            }
+            
+            .section {
+                margin-bottom: 40px;
+                padding: 25px;
+                border: 2px solid #f0f0f0;
+                border-radius: 10px;
+                background: #fafafa;
+            }
+            
+            .section h2 {
+                color: #333;
+                margin-bottom: 20px;
+                font-size: 1.5em;
+                border-bottom: 2px solid #667eea;
+                padding-bottom: 10px;
+            }
+            
+            .form-group {
+                margin-bottom: 20px;
+            }
+            
+            .form-group label {
+                display: block;
+                margin-bottom: 8px;
+                font-weight: 600;
+                color: #555;
+            }
+            
+            .form-group input[type="text"],
+            .form-group input[type="number"],
+            .form-group input[type="file"] {
+                width: 100%;
+                padding: 12px;
+                border: 2px solid #ddd;
+                border-radius: 8px;
+                font-size: 16px;
+                transition: border-color 0.3s;
+            }
+            
+            .form-group input:focus {
+                outline: none;
+                border-color: #667eea;
+            }
+            
+            .btn {
+                background: linear-gradient(45deg, #667eea, #764ba2);
+                color: white;
+                border: none;
+                padding: 12px 25px;
+                border-radius: 8px;
+                cursor: pointer;
+                font-size: 16px;
+                font-weight: 600;
+                transition: transform 0.2s, box-shadow 0.2s;
+                margin-right: 10px;
+                margin-bottom: 10px;
+            }
+            
+            .btn:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+            }
+            
+            .btn:disabled {
+                opacity: 0.6;
+                cursor: not-allowed;
+                transform: none;
+            }
+            
+            .status {
+                background: #e8f5e8;
+                border: 2px solid #4caf50;
+                border-radius: 8px;
+                padding: 15px;
+                margin-bottom: 20px;
+            }
+            
+            .status.scanning {
+                background: #fff3cd;
+                border-color: #ffc107;
+            }
+            
+            .results {
+                margin-top: 20px;
+            }
+            
+            .result-item {
+                display: flex;
+                align-items: center;
+                padding: 15px;
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                margin-bottom: 10px;
+                background: white;
+                transition: box-shadow 0.2s;
+            }
+            
+            .result-item:hover {
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }
+            
+            .result-image {
+                width: 80px;
+                height: 80px;
+                object-fit: cover;
+                border-radius: 8px;
+                margin-right: 15px;
+                border: 2px solid #ddd;
+            }
+            
+            .result-info {
+                flex: 1;
+            }
+            
+            .result-info h4 {
+                color: #333;
+                margin-bottom: 5px;
+            }
+            
+            .result-info p {
+                color: #666;
+                margin-bottom: 3px;
+            }
+            
+            .score {
+                background: #667eea;
+                color: white;
+                padding: 5px 10px;
+                border-radius: 15px;
+                font-size: 14px;
+                font-weight: 600;
+            }
+            
+            .loading {
+                text-align: center;
+                padding: 20px;
+                color: #666;
+            }
+            
+            .error {
+                background: #f8d7da;
+                border: 2px solid #dc3545;
+                color: #721c24;
+                padding: 15px;
+                border-radius: 8px;
+                margin-bottom: 20px;
+            }
+            
+            .two-column {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 20px;
+            }
+            
+            @media (max-width: 768px) {
+                .two-column {
+                    grid-template-columns: 1fr;
+                }
+                
+                .result-item {
+                    flex-direction: column;
+                    text-align: center;
+                }
+                
+                .result-image {
+                    margin-right: 0;
+                    margin-bottom: 10px;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🔍 CLIP Image Search</h1>
+                <p>Semantic image search powered by OpenAI CLIP</p>
+            </div>
+            
+            <div class="content">
+                <!-- Status Section -->
+                <div class="section">
+                    <h2>📊 Server Status</h2>
+                    <div id="status" class="status">
+                        Loading status...
+                    </div>
+                    <button class="btn" onclick="updateStatus()">🔄 Refresh Status</button>
+                </div>
+                
+                <!-- Scan Directory Section -->
+                <div class="section">
+                    <h2>📁 Scan Directory</h2>
+                    <p style="margin-bottom: 15px; color: #666;">Scan the ./db directory for new images and generate embeddings.</p>
+                    <button class="btn" id="scanBtn" onclick="scanDirectory()">🔍 Start Scan</button>
+                    <div id="scanProgress" style="margin-top: 15px;"></div>
+                </div>
+                
+                <div class="two-column">
+                    <!-- Text Query Section -->
+                    <div class="section">
+                        <h2>💬 Text Search</h2>
+                        <div class="form-group">
+                            <label for="queryText">Search Description:</label>
+                            <input type="text" id="queryText" placeholder="e.g., a cat sitting on a chair" />
+                        </div>
+                        <div class="form-group">
+                            <label for="queryTopK">Number of Results:</label>
+                            <input type="number" id="queryTopK" value="5" min="1" max="50" />
+                        </div>
+                        <button class="btn" onclick="searchByText()">🔍 Search</button>
+                        <div id="queryResults" class="results"></div>
+                    </div>
+                    
+                    <!-- Similar Image Section -->
+                    <div class="section">
+                        <h2>🖼️ Similar Images</h2>
+                        <div class="form-group">
+                            <label for="similarFile">Upload Image:</label>
+                            <input type="file" id="similarFile" accept="image/*" />
+                        </div>
+                        <div class="form-group">
+                            <label for="similarTopK">Number of Results:</label>
+                            <input type="number" id="similarTopK" value="5" min="1" max="50" />
+                        </div>
+                        <button class="btn" onclick="searchSimilar()">🔍 Find Similar</button>
+                        <div id="similarResults" class="results"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <script>
+            // Update server status
+            async function updateStatus() {
+                try {
+                    const response = await fetch('/status');
+                    const data = await response.json();
+                    const statusDiv = document.getElementById('status');
+                    
+                    const isScanning = data.scanning;
+                    statusDiv.className = isScanning ? 'status scanning' : 'status';
+                    
+                    statusDiv.innerHTML = `
+                        <strong>📈 Image Count:</strong> ${data.image_count}<br>
+                        <strong>🔄 Status:</strong> ${isScanning ? 'Scanning...' : 'Ready'}<br>
+                        <strong>⏰ Last Scan:</strong> ${data.last_scan_time || 'Never'}
+                    `;
+                } catch (error) {
+                    document.getElementById('status').innerHTML = `<div class="error">❌ Error: ${error.message}</div>`;
+                }
+            }
+            
+            // Scan directory
+            async function scanDirectory() {
+                const scanBtn = document.getElementById('scanBtn');
+                const progressDiv = document.getElementById('scanProgress');
+                
+                scanBtn.disabled = true;
+                scanBtn.textContent = '🔄 Scanning...';
+                progressDiv.innerHTML = '<div class="loading">📊 Scanning directory...</div>';
+                
+                try {
+                    const response = await fetch('/scandir');
+                    const reader = response.body.getReader();
+                    
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        
+                        const chunk = new TextDecoder().decode(value);
+                        const lines = chunk.split('\n');
+                        
+                        for (const line of lines) {
+                            if (line.startsWith('data: ')) {
+                                const data = JSON.parse(line.substring(6));
+                                progressDiv.innerHTML = `
+                                    <div class="status">
+                                        📊 Progress: ${data.progress}% - ${data.status}
+                                    </div>
+                                `;
+                            }
+                        }
+                    }
+                    
+                    progressDiv.innerHTML = '<div class="status">✅ Scan completed successfully!</div>';
+                    updateStatus();
+                } catch (error) {
+                    progressDiv.innerHTML = `<div class="error">❌ Error: ${error.message}</div>`;
+                } finally {
+                    scanBtn.disabled = false;
+                    scanBtn.textContent = '🔍 Start Scan';
+                }
+            }
+            
+            // Search by text
+            async function searchByText() {
+                const text = document.getElementById('queryText').value.trim();
+                const topK = document.getElementById('queryTopK').value;
+                const resultsDiv = document.getElementById('queryResults');
+                
+                if (!text) {
+                    resultsDiv.innerHTML = '<div class="error">❌ Please enter search text</div>';
+                    return;
+                }
+                
+                resultsDiv.innerHTML = '<div class="loading">🔍 Searching...</div>';
+                
+                try {
+                    const response = await fetch(`/query?text=${encodeURIComponent(text)}&top_k=${topK}`);
+                    const data = await response.json();
+                    
+                    if (data.error) {
+                        resultsDiv.innerHTML = `<div class="error">❌ ${data.error}</div>`;
+                        return;
+                    }
+                    
+                    displayResults(data.results, resultsDiv);
+                } catch (error) {
+                    resultsDiv.innerHTML = `<div class="error">❌ Error: ${error.message}</div>`;
+                }
+            }
+            
+            // Search similar images
+            async function searchSimilar() {
+                const fileInput = document.getElementById('similarFile');
+                const topK = document.getElementById('similarTopK').value;
+                const resultsDiv = document.getElementById('similarResults');
+                
+                if (!fileInput.files[0]) {
+                    resultsDiv.innerHTML = '<div class="error">❌ Please select an image file</div>';
+                    return;
+                }
+                
+                const file = fileInput.files[0];
+                if (!file.type.startsWith('image/')) {
+                    resultsDiv.innerHTML = '<div class="error">❌ Please select a valid image file</div>';
+                    return;
+                }
+                
+                resultsDiv.innerHTML = '<div class="loading">🔍 Finding similar images...</div>';
+                
+                try {
+                    const formData = new FormData();
+                    formData.append('top_k', topK);
+                    
+                    const response = await fetch('/similar', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': file.type
+                        },
+                        body: file
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.error) {
+                        resultsDiv.innerHTML = `<div class="error">❌ ${data.error}</div>`;
+                        return;
+                    }
+                    
+                    displayResults(data.results, resultsDiv);
+                } catch (error) {
+                    resultsDiv.innerHTML = `<div class="error">❌ Error: ${error.message}</div>`;
+                }
+            }
+            
+            // Display search results
+            function displayResults(results, container) {
+                if (!results || results.length === 0) {
+                    container.innerHTML = '<div class="loading">📭 No results found</div>';
+                    return;
+                }
+                
+                const html = results.map(result => `
+                    <div class="result-item">
+                        <img src="/db/${result.key}" alt="${result.key}" class="result-image" onerror="this.src='data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iODAiIGhlaWdodD0iODAiIHZpZXdCb3g9IjAgMCA4MCA4MCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHJlY3Qgd2lkdGg9IjgwIiBoZWlnaHQ9IjgwIiBmaWxsPSIjRjBGMEYwIi8+CjxwYXRoIGQ9Ik0yNCAzMkw0MCA0OEw1NiAzMiIgc3Ryb2tlPSIjOTk5OTk5IiBzdHJva2Utd2lkdGg9IjIiLz4KPC9zdmc+'" />
+                        <div class="result-info">
+                            <h4>📁 ${result.key}</h4>
+                            <p>📏 Size: ${formatFileSize(result.imageSize)}</p>
+                        </div>
+                        <div class="score">${result.score.toFixed(1)}%</div>
+                    </div>
+                `).join('');
+                
+                container.innerHTML = html;
+            }
+            
+            // Format file size
+            function formatFileSize(bytes) {
+                if (bytes === 0) return '0 Bytes';
+                const k = 1024;
+                const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+                const i = Math.floor(Math.log(bytes) / Math.log(k));
+                return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+            }
+            
+            // Initialize
+            document.addEventListener('DOMContentLoaded', function() {
+                updateStatus();
+                setInterval(updateStatus, 5000); // Update status every 5 seconds
+                
+                // Allow Enter key for text search
+                document.getElementById('queryText').addEventListener('keypress', function(e) {
+                    if (e.key === 'Enter') {
+                        searchByText();
+                    }
+                });
+            });
+        </script>
+    </body>
+</html>
