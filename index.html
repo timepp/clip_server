@@ -267,6 +267,10 @@
                             <input type="file" id="similarFile" accept="image/*" />
                         </div>
                         <div class="form-group">
+                            <label for="similarKey">Or Search by Key:</label>
+                            <input type="text" id="similarKey" placeholder="e.g. 640.jpg" />
+                        </div>
+                        <div class="form-group">
                             <label for="similarTopK">Number of Results:</label>
                             <input type="number" id="similarTopK" value="5" min="1" max="50" />
                         </div>
@@ -371,41 +375,47 @@
             // Search similar images
             async function searchSimilar() {
                 const fileInput = document.getElementById('similarFile');
+                const keyInput = document.getElementById('similarKey');
                 const topK = document.getElementById('similarTopK').value;
                 const resultsDiv = document.getElementById('similarResults');
-                
-                if (!fileInput.files[0]) {
-                    resultsDiv.innerHTML = '<div class="error">❌ Please select an image file</div>';
+                const key = keyInput.value.trim();
+
+                if (!fileInput.files[0] && !key) {
+                    resultsDiv.innerHTML = '<div class="error">❌ Please select an image file or enter a key</div>';
                     return;
                 }
-                
-                const file = fileInput.files[0];
-                if (!file.type.startsWith('image/')) {
-                    resultsDiv.innerHTML = '<div class="error">❌ Please select a valid image file</div>';
-                    return;
-                }
-                
+
                 resultsDiv.innerHTML = '<div class="loading">🔍 Finding similar images...</div>';
-                
+
                 try {
-                    const formData = new FormData();
-                    formData.append('top_k', topK);
-                    
-                    const response = await fetch('/similar', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': file.type
-                        },
-                        body: file
-                    });
-                    
-                    const data = await response.json();
-                    
+                    let response, data;
+                    if (key) {
+                        // 通过key查找
+                        const formData = new FormData();
+                        formData.append('key', key);
+                        formData.append('top_k', topK);
+                        response = await fetch('/similar', {
+                            method: 'POST',
+                            body: formData
+                        });
+                    } else {
+                        // 上传图片查找
+                        const file = fileInput.files[0];
+                        const formData = new FormData();
+                        formData.append('top_k', topK);
+                        response = await fetch('/similar?top_k=' + topK, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': file.type
+                            },
+                            body: file
+                        });
+                    }
+                    data = await response.json();
                     if (data.error) {
                         resultsDiv.innerHTML = `<div class="error">❌ ${data.error}</div>`;
                         return;
                     }
-                    
                     displayResults(data.results, resultsDiv);
                 } catch (error) {
                     resultsDiv.innerHTML = `<div class="error">❌ Error: ${error.message}</div>`;
@@ -420,15 +430,17 @@
                 }
                 
                 const html = results.map(result => `
-                    <div class="result-item">
-                        <img src="/db/${result.key}" alt="${result.key}" class="result-image" onerror="this.src='data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iODAiIGhlaWdodD0iODAiIHZpZXdCb3g9IjAgMCA4MCA4MCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHJlY3Qgd2lkdGg9IjgwIiBoZWlnaHQ9IjgwIiBmaWxsPSIjRjBGMEYwIi8+CjxwYXRoIGQ9Ik0yNCAzMkw0MCA0OEw1NiAzMiIgc3Ryb2tlPSIjOTk5OTk5IiBzdHJva2Utd2lkdGg9IjIiLz4KPC9zdmc+'" />
-                        <div class="result-info">
-                            <h4>📁 ${result.key}</h4>
-                            <p>📏 Size: ${formatFileSize(result.imageSize)}</p>
-                        </div>
-                        <div class="score">${result.score.toFixed(1)}%</div>
-                    </div>
-                `).join('');
+    <div class="result-item">
+        <a href="/db/${result.key}" target="_blank">
+            <img src="/db/${result.key}" alt="${result.key}" class="result-image" onerror="this.src='data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iODAiIGhlaWdodD0iODAiIHZpZXdCb3g9IjAgMCA4MCA4MCIgZmlsbD0ibm9uZSIgeG1zbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHJlY3Qgd2lkdGg9IjgwIiBoZWlnaHQ9IjgwIiBmaWxsPSIjRjBGMEYwIi8+CjxwYXRoIGQ9Ik0yNCAzMkw0MCA0OEw1NiAzMiIgc3Ryb2tlPSIjOTk5OTk5IiBzdHJva2Utd2lkdGg9IjIiLz4KPC9zdmc='" />
+        </a>
+        <div class="result-info">
+            <h4>📁 ${result.key}</h4>
+            <p>📏 Size: ${formatFileSize(result.imageSize)}</p>
+        </div>
+        <div class="score">${result.score.toFixed(1)}%</div>
+    </div>
+`).join('');
                 
                 container.innerHTML = html;
             }

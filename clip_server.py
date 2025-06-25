@@ -105,7 +105,7 @@ class ImageSearchServer:
             embedding = self.get_image_embedding(image_data, os.path.splitext(image_path)[1].lower())
             image_size = os.path.getsize(image_path)
             rel_path = os.path.relpath(image_path, self.image_dir)
-            return idx, embedding, {"key": rel_path, "imageSize": image_size}
+            return idx, embedding, {"key": rel_path, "imageSize": image_size, "source": "db"}
         except Exception as e:
             logger.error(f"Error processing {image_path}: {e}")
             return idx, None, None
@@ -119,6 +119,27 @@ class ImageSearchServer:
         embeddings = list(np.load(self.embeddings_file).astype(np.float32) if os.path.exists(self.embeddings_file) else [])
         existing_keys = {item["key"] for item in self.metadata}
 
+        # --- 新增：删除source为'db'但文件已不存在的条目 ---
+        to_delete = []
+        for i, meta in enumerate(self.metadata):
+            if meta.get("source") == "db":
+                file_path = os.path.join(self.image_dir, meta["key"])
+                if not os.path.exists(file_path):
+                    to_delete.append(i)
+        # 倒序删除，避免索引错位
+        for i in reversed(to_delete):
+            logger.info(f"Removing metadata and embedding for missing file: {self.metadata[i]['key']}")
+            del self.metadata[i]
+            if i < len(embeddings):
+                del embeddings[i]
+        self.save_metadata()
+        self.save_embeddings(embeddings)
+        self.index.reset()
+        if embeddings:
+            self.index.add(np.array(embeddings, dtype=np.float32))
+        self.status["image_count"] = len(self.metadata)
+
+        # --- 继续原有扫描逻辑 ---
         for root, _, files in os.walk(self.image_dir):
             for file in files:
                 if os.path.splitext(file)[1].lower() in valid_extensions:
@@ -198,32 +219,41 @@ def add():
     image_data = request.data
     image_type = request.headers.get("Content-Type", "").split("/")[-1].lower()
     key = request.form.get("key")
-    metadata = request.form.get("metadata")
-    
-    if not key or not metadata or not image_type in {"jpg", "jpeg", "png"}:
-        return jsonify({"error": "Missing or invalid key, metadata, or image_type"}), 400
-    
-    try:
-        metadata = json.loads(metadata)
-        if not isinstance(metadata, dict) or "imageSize" not in metadata or metadata["key"] != key:
-            return jsonify({"error": "Invalid metadata format"}), 400
-    except json.JSONDecodeError:
-        return jsonify({"error": "Invalid metadata JSON"}), 400
+    extra_metadata = request.form.get("metadata")
+
+    if not key or not image_type in {"jpg", "jpeg", "png"}:
+        return jsonify({"error": "Missing or invalid key or image_type"}), 400
+
+    # 解析额外metadata
+    extra = {}
+    if extra_metadata:
+        try:
+            extra = json.loads(extra_metadata)
+            if not isinstance(extra, dict):
+                return jsonify({"error": "Invalid metadata format, must be a dict"}), 400
+        except json.JSONDecodeError:
+            return jsonify({"error": "Invalid metadata JSON"}), 400
 
     try:
         embedding = server.get_image_embedding(image_data, image_type)
         embeddings = list(np.load(server.embeddings_file).astype(np.float32) if os.path.exists(server.embeddings_file) else [])
         idx = len(server.metadata)
-        
+
+        # 获取真实imageSize
+        image_size = len(image_data)
+        # 构造新的metadata
+        new_metadata = {"key": key, "imageSize": image_size, "source": "db"}
+        new_metadata.update(extra)
+
         # Check if key exists
         existing_idx = next((i for i, m in enumerate(server.metadata) if m["key"] == key), None)
         if existing_idx is not None:
-            server.metadata[existing_idx] = metadata
+            server.metadata[existing_idx] = new_metadata
             embeddings[existing_idx] = embedding
         else:
-            server.metadata.append(metadata)
+            server.metadata.append(new_metadata)
             embeddings.append(embedding)
-        
+
         server.save_metadata()
         server.save_embeddings(embeddings)
         server.index.reset()
@@ -261,19 +291,30 @@ def query():
 
 @app.route("/similar", methods=["POST"])
 def similar():
-    if not request.data:
-        return jsonify({"error": "No image data provided"}), 400
-    
-    image_data = request.data
-    image_type = request.headers.get("Content-Type", "").split("/")[-1].lower()
+    # 新增：支持通过key直接查找
+    key = request.form.get("key") or request.args.get("key")
     top_k = int(request.form.get("top_k", 5)) if request.form.get("top_k") else int(request.args.get("top_k", 5))
-    
-    if not image_type in {"jpg", "jpeg", "png"}:
-        return jsonify({"error": "Invalid image type. Supported: jpg, jpeg, png"}), 400
-    
-    try:
+
+    if key:
+        # 通过key查找embedding
+        idx = next((i for i, m in enumerate(server.metadata) if m["key"] == key), None)
+        if idx is None:
+            return jsonify({"error": f"Key '{key}' not found"}), 404
+        embeddings = np.load(server.embeddings_file).astype(np.float32)
+        image_embedding = embeddings[idx].astype(np.float32)
+        query_embedding = np.expand_dims(image_embedding, axis=0)
+    else:
+        if not request.data:
+            return jsonify({"error": "No image data provided"}), 400
+        image_data = request.data
+        image_type = request.headers.get("Content-Type", "").split("/")[-1].lower()
+        if not image_type in {"jpg", "jpeg", "png"}:
+            return jsonify({"error": "Invalid image type. Supported: jpg, jpeg, png"}), 400
         image_embedding = server.get_image_embedding(image_data, image_type).astype(np.float32)
-        distances, indices = server.index.search(np.array([image_embedding]), top_k)
+        query_embedding = np.array([image_embedding])
+
+    try:
+        distances, indices = server.index.search(query_embedding, top_k)
         results = []
         for idx, score in zip(indices[0], distances[0]):
             if idx < len(server.metadata):
@@ -283,10 +324,10 @@ def similar():
                     "imageSize": meta["imageSize"],
                     "score": float(score * 100)
                 })
-        logger.info(f"Queried similar images with uploaded image, found {len(results)} matches")
+        logger.info(f"Queried similar images with key={key if key else '[uploaded image]'}, found {len(results)} matches")
         return jsonify({"results": results}), 200
     except Exception as e:
-        logger.error(f"Error processing similar query with uploaded image: {e}")
+        logger.error(f"Error processing similar query with key={key}: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/delete", methods=["GET"])
@@ -316,4 +357,4 @@ def delete():
 if __name__ == "__main__":
     logger.info("Starting Image Search Server")
     server = ImageSearchServer()
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5000, debug=True)
