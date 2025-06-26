@@ -1,1 +1,1 @@
-docker run -it --name clip-server --rm -v %cd%/clip_server.py:/app/clip_server.py -v %cd%/index.html:/app/index.html -v %cd%/db:/app/db -p 5000:5000 clip-server:latest
+docker run -it --name clip-server --rm -v %cd%/clip_server.py:/app/clip_server.py -v %cd%/index.html:/app/index.html -v %cd%/db:/app/db -v %cd%/pipe:/app/pipe -p 5000:5000 clip-server:latest

@@ -12,6 +12,7 @@ from flask_cors import CORS
 from transformers import CLIPModel, CLIPProcessor
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
+import cv2
 
 app = Flask(__name__)
 CORS(app)
@@ -110,23 +111,71 @@ class ImageSearchServer:
             logger.error(f"Error processing {image_path}: {e}")
             return idx, None, None
 
-    def scan_directory(self):
+    def extract_video_frames(self, video_path, interval_sec=10, sim_threshold=0.95):
+        """
+        从视频每隔interval_sec抽取一帧，若与上一帧embedding相似度大于sim_threshold则跳过。
+        返回：(key, embedding, metadata) 列表
+        """
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames / fps if fps else 0
+        results = []
+        prev_emb = None
+        prev_t = 0
+        t = 0
+        while t < duration:
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ret, frame = cap.read()
+            if not ret:
+                break
+            # 转为JPEG编码
+            _, buf = cv2.imencode('.jpg', frame)
+            image_data = buf.tobytes()
+            emb = self.get_image_embedding(image_data, 'jpg')
+            if prev_emb is not None:
+                sim = float(np.dot(emb, prev_emb) / (np.linalg.norm(emb) * np.linalg.norm(prev_emb) + 1e-8))
+                logger.info(f"Similarity between {prev_t} - {t}: {sim:.4f}")
+                if sim > sim_threshold:
+                    t += interval_sec
+                    continue
+            prev_emb = emb
+            prev_t = t
+            # 生成key
+            h = int(t // 3600)
+            m = int((t % 3600) // 60)
+            s = int(t % 60)
+            key = f"{os.path.relpath(video_path, self.image_dir)}>{h:02}:{m:02}:{s:02}"
+            meta = {
+                "key": key,
+                "imageSize": len(image_data),
+                "source": "db",
+                "video_file": os.path.relpath(video_path, self.image_dir),
+                "timestamp": f"{h:02}:{m:02}:{s:02}"
+            }
+            results.append((key, emb, meta))
+            t += interval_sec
+        cap.release()
+        return results
+
+    def scan_directory(self, scan_videos=False):
         self.status["scanning"] = True
         self.status["last_scan_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
         logger.info("Starting directory scan")
         valid_extensions = {".jpg", ".jpeg", ".png"}
+        if scan_videos:
+            valid_extensions.add(".mp4")
         futures = []
         embeddings = list(np.load(self.embeddings_file).astype(np.float32) if os.path.exists(self.embeddings_file) else [])
         existing_keys = {item["key"] for item in self.metadata}
 
-        # --- 新增：删除source为'db'但文件已不存在的条目 ---
+        # 删除source为'db'但文件已不存在的条目
         to_delete = []
         for i, meta in enumerate(self.metadata):
             if meta.get("source") == "db":
-                file_path = os.path.join(self.image_dir, meta["key"])
+                file_path = os.path.join(self.image_dir, meta["key"].split('>')[0])
                 if not os.path.exists(file_path):
                     to_delete.append(i)
-        # 倒序删除，避免索引错位
         for i in reversed(to_delete):
             logger.info(f"Removing metadata and embedding for missing file: {self.metadata[i]['key']}")
             del self.metadata[i]
@@ -139,29 +188,29 @@ class ImageSearchServer:
             self.index.add(np.array(embeddings, dtype=np.float32))
         self.status["image_count"] = len(self.metadata)
 
-        # --- 继续原有扫描逻辑 ---
+        # 新增：处理图片和（可选）视频
         for root, _, files in os.walk(self.image_dir):
             for file in files:
-                if os.path.splitext(file)[1].lower() in valid_extensions:
-                    image_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(image_path, self.image_dir)
+                ext = os.path.splitext(file)[1].lower()
+                image_path = os.path.join(root, file)
+                rel_path = os.path.relpath(image_path, self.image_dir)
+                if ext in {".jpg", ".jpeg", ".png"}:
                     if rel_path not in existing_keys:
                         idx = len(self.metadata)
                         futures.append(self.executor.submit(self.process_image, image_path, idx))
-
-        for future in tqdm(futures, desc="Processing images"):
-            idx, embedding, meta = future.result()
-            if embedding is not None:
-                self.metadata.append(meta)
-                embeddings.append(embedding)
-                self.status["image_count"] = len(self.metadata)
-                self.save_metadata()
-                self.save_embeddings(embeddings)
-
+                elif scan_videos and ext == ".mp4":
+                    # 视频帧抽取
+                    video_results = self.extract_video_frames(image_path, interval_sec=2, sim_threshold=0.87)
+                    for key, emb, meta in video_results:
+                        if key not in existing_keys:
+                            self.metadata.append(meta)
+                            embeddings.append(emb)
+                            self.status["image_count"] = len(self.metadata)
+                            self.save_metadata()
+                            self.save_embeddings(embeddings)
         if embeddings:
             self.index.reset()
             self.index.add(np.array(embeddings, dtype=np.float32))
-
         self.status["scanning"] = False
         logger.info("Directory scan completed")
 
@@ -203,9 +252,10 @@ def status():
 
 @app.route("/scandir", methods=["GET"])
 def scandir():
+    scan_videos = request.args.get("scan_videos", "false").lower() == "true"
     if server.status["scanning"]:
         return jsonify({"error": "Scan already in progress"}), 400
-    server.executor.submit(server.scan_directory)
+    server.executor.submit(server.scan_directory, scan_videos)
     return Response(
         response=server.generate_sse_progress(),
         content_type="text/event-stream",
@@ -353,6 +403,111 @@ def delete():
     except Exception as e:
         logger.error(f"Error deleting image with key {key}: {e}")
         return jsonify({"error": str(e)}), 500
+
+@app.route("/ve", methods=["GET"])
+def ve_debug():
+    import cv2
+    from PIL import Image, ImageDraw, ImageFont
+    import math
+    import io
+
+    interval = float(request.args.get("interval", 2))
+    thumb_width = int(request.args.get("thumb_width", 200))
+    thumbs_per_row = int(request.args.get("thumbs_per_row", 10))
+    sim_threshold = float(request.args.get("sim_threshold", 0.87))
+    video_path = "./pipe/ve.mp4"
+    out_path = "./pipe/ve.jpg"
+    font_path = None
+
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps if fps else 0
+
+    thumbs = []
+    times = []
+    embs = []
+    t = 0
+    while t < duration:
+        logger.info(f"Processing time {t:.2f}s")
+        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img)
+        w, h = pil_img.size
+        scale = thumb_width / w
+        thumb = pil_img.resize((thumb_width, int(h * scale)))
+        thumbs.append(thumb)
+        times.append(t)
+        # embedding
+        _, buf = cv2.imencode('.jpg', frame)
+        image_data = buf.tobytes()
+        emb = server.get_image_embedding(image_data, 'jpg')
+        embs.append(emb)
+        t += interval
+    cap.release()
+
+    # 突变帧检测，并记录每帧与上一个突变帧的相似度
+    mutation_idx = [0]
+    sim_to_last_mutation = [None]  # 第0帧无相似度
+    for i in range(1, len(embs)):
+        # 计算与所有突变帧的相似度
+        sims = [float(np.dot(embs[i], embs[m]) / (np.linalg.norm(embs[i]) * np.linalg.norm(embs[m]) + 1e-8)) for m in mutation_idx]
+        sim_to_last_mutation.append(sims[-1])  # 记录与最近突变帧的相似度
+        # 只有所有突变帧都不大于threshold才新增
+        if all(sim <= sim_threshold for sim in sims):
+            mutation_idx.append(i)
+
+    # 字体
+    try:
+        font = ImageFont.truetype(font_path or "arial.ttf", 18)
+        font_big = ImageFont.truetype(font_path or "arial.ttf", 26)
+    except:
+        font = ImageFont.load_default()
+        font_big = ImageFont.load_default()
+
+    thumbs_with_time = []
+    for idx, (thumb, t) in enumerate(zip(thumbs, times)):
+        w, h = thumb.size
+        canvas = Image.new("RGB", (w, h + 48), (255, 255, 255))
+        canvas.paste(thumb, (0, 0))
+        draw = ImageDraw.Draw(canvas)
+        time_str = "%02d:%02d:%02d" % (t // 3600, (t % 3600) // 60, t % 60)
+        # 取与最近突变帧的相似度
+        if idx == 0:
+            sim_str = "(N/A)"
+        else:
+            sim = sim_to_last_mutation[idx]
+            sim_str = f"({sim:.2f})"
+        label = f"{time_str}{sim_str}"
+        is_mutation = idx in mutation_idx
+        # 画红框
+        if is_mutation:
+            draw.rectangle([0, 0, w-1, h-1], outline=(255, 0, 0), width=6)
+        # 时间戳+相似度
+        if is_mutation:
+            bbox = draw.textbbox((0, 0), label, font=font_big)
+            text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            draw.text(((w - text_w) // 2, h + 2), label, fill=(255, 0, 0), font=font_big)
+        else:
+            bbox = draw.textbbox((0, 0), label, font=font)
+            text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            draw.text(((w - text_w) // 2, h + 12), label, fill=(0, 0, 0), font=font)
+        thumbs_with_time.append(canvas)
+
+    # 拼接成矩阵
+    rows = math.ceil(len(thumbs_with_time) / thumbs_per_row)
+    thumb_h = thumbs_with_time[0].height if thumbs_with_time else 0
+    grid = Image.new("RGB", (thumb_width * thumbs_per_row, thumb_h * rows), (255, 255, 255))
+    for idx, thumb in enumerate(thumbs_with_time):
+        x = (idx % thumbs_per_row) * thumb_width
+        y = (idx // thumbs_per_row) * thumb_h
+        grid.paste(thumb, (x, y))
+    grid.save(out_path)
+    # 直接返回图片
+    return send_file(out_path, mimetype='image/jpeg')
 
 if __name__ == "__main__":
     logger.info("Starting Image Search Server")
