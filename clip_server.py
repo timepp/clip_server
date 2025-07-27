@@ -404,6 +404,72 @@ def delete():
         logger.error(f"Error deleting image with key {key}: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route("/files", methods=["GET"])
+def list_files():
+    """
+    List files in the database with optional filtering by filename substring.
+    Parameters:
+    - filter: optional string to filter filenames (case-insensitive)
+    - limit: optional limit on number of results (default: 100)
+    - offset: optional offset for pagination (default: 0)
+    """
+    try:
+        filter_str = request.args.get("filter", "").lower()
+        limit = int(request.args.get("limit", 100))
+        offset = int(request.args.get("offset", 0))
+        
+        # Validate parameters
+        if limit < 1 or limit > 1000:
+            return jsonify({"error": "Limit must be between 1 and 1000"}), 400
+        if offset < 0:
+            return jsonify({"error": "Offset must be non-negative"}), 400
+        
+        # Filter files based on the filter string
+        filtered_files = []
+        for meta in server.metadata:
+            key = meta.get("key", "")
+            if not filter_str or filter_str in key.lower():
+                file_info = {
+                    "key": key,
+                    "imageSize": meta.get("imageSize", 0),
+                    "source": meta.get("source", "unknown")
+                }
+                
+                # Add additional metadata for video frames
+                if "video_file" in meta:
+                    file_info["video_file"] = meta["video_file"]
+                    file_info["timestamp"] = meta.get("timestamp", "")
+                    file_info["type"] = "video_frame"
+                else:
+                    file_info["type"] = "image"
+                
+                filtered_files.append(file_info)
+        
+        # Apply pagination
+        total_count = len(filtered_files)
+        paginated_files = filtered_files[offset:offset + limit]
+        
+        result = {
+            "files": paginated_files,
+            "total_count": total_count,
+            "returned_count": len(paginated_files),
+            "offset": offset,
+            "limit": limit,
+            "has_more": offset + limit < total_count
+        }
+        
+        if filter_str:
+            result["filter"] = filter_str
+        
+        logger.info(f"Listed files: filter='{filter_str}', total={total_count}, returned={len(paginated_files)}")
+        return jsonify(result), 200
+        
+    except ValueError as e:
+        return jsonify({"error": f"Invalid parameter: {str(e)}"}), 400
+    except Exception as e:
+        logger.error(f"Error listing files: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/ve", methods=["GET"])
 def ve_debug():
     import cv2
@@ -411,103 +477,144 @@ def ve_debug():
     import math
     import io
 
+    # Get parameters from request
+    video_path = request.args.get("path")
+    if not video_path:
+        return jsonify({"error": "Missing 'path' parameter"}), 400
+    
+    # Security check: ensure the file is within allowed directories
+    allowed_dirs = ["./db", "./pipe"]
+    video_path_abs = os.path.abspath(video_path)
+    if not any(video_path_abs.startswith(os.path.abspath(allowed_dir)) for allowed_dir in allowed_dirs):
+        return jsonify({"error": "Access denied - path not in allowed directories"}), 403
+    
+    # Check if file exists and is an mp4
+    if not os.path.exists(video_path):
+        return jsonify({"error": f"Video file not found: {video_path}"}), 404
+    
+    if not video_path.lower().endswith('.mp4'):
+        return jsonify({"error": "Only MP4 files are supported"}), 400
+
     interval = float(request.args.get("interval", 2))
     thumb_width = int(request.args.get("thumb_width", 200))
     thumbs_per_row = int(request.args.get("thumbs_per_row", 10))
     sim_threshold = float(request.args.get("sim_threshold", 0.87))
-    video_path = "./pipe/ve.mp4"
-    out_path = "./pipe/ve.jpg"
+    
+    # Generate output path based on input video
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    out_dir = "./pipe"
+    out_path = os.path.join(out_dir, f"{video_name}_ve.jpg")
     font_path = None
 
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = total_frames / fps if fps else 0
-
-    thumbs = []
-    times = []
-    embs = []
-    t = 0
-    while t < duration:
-        logger.info(f"Processing time {t:.2f}s")
-        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-        ret, frame = cap.read()
-        if not ret:
-            break
-        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(img)
-        w, h = pil_img.size
-        scale = thumb_width / w
-        thumb = pil_img.resize((thumb_width, int(h * scale)))
-        thumbs.append(thumb)
-        times.append(t)
-        # embedding
-        _, buf = cv2.imencode('.jpg', frame)
-        image_data = buf.tobytes()
-        emb = server.get_image_embedding(image_data, 'jpg')
-        embs.append(emb)
-        t += interval
-    cap.release()
-
-    # 突变帧检测，并记录每帧与上一个突变帧的相似度
-    mutation_idx = [0]
-    sim_to_last_mutation = [None]  # 第0帧无相似度
-    for i in range(1, len(embs)):
-        # 计算与所有突变帧的相似度
-        sims = [float(np.dot(embs[i], embs[m]) / (np.linalg.norm(embs[i]) * np.linalg.norm(embs[m]) + 1e-8)) for m in mutation_idx]
-        sim_to_last_mutation.append(sims[-1])  # 记录与最近突变帧的相似度
-        # 只有所有突变帧都不大于threshold才新增
-        if all(sim <= sim_threshold for sim in sims):
-            mutation_idx.append(i)
-
-    # 字体
     try:
-        font = ImageFont.truetype(font_path or "arial.ttf", 18)
-        font_big = ImageFont.truetype(font_path or "arial.ttf", 26)
-    except:
-        font = ImageFont.load_default()
-        font_big = ImageFont.load_default()
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return jsonify({"error": f"Cannot open video file: {video_path}"}), 400
+            
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames / fps if fps else 0
 
-    thumbs_with_time = []
-    for idx, (thumb, t) in enumerate(zip(thumbs, times)):
-        w, h = thumb.size
-        canvas = Image.new("RGB", (w, h + 48), (255, 255, 255))
-        canvas.paste(thumb, (0, 0))
-        draw = ImageDraw.Draw(canvas)
-        time_str = "%02d:%02d:%02d" % (t // 3600, (t % 3600) // 60, t % 60)
-        # 取与最近突变帧的相似度
-        if idx == 0:
-            sim_str = "(N/A)"
-        else:
-            sim = sim_to_last_mutation[idx]
-            sim_str = f"({sim:.2f})"
-        label = f"{time_str}{sim_str}"
-        is_mutation = idx in mutation_idx
-        # 画红框
-        if is_mutation:
-            draw.rectangle([0, 0, w-1, h-1], outline=(255, 0, 0), width=6)
-        # 时间戳+相似度
-        if is_mutation:
-            bbox = draw.textbbox((0, 0), label, font=font_big)
-            text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            draw.text(((w - text_w) // 2, h + 2), label, fill=(255, 0, 0), font=font_big)
-        else:
-            bbox = draw.textbbox((0, 0), label, font=font)
-            text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            draw.text(((w - text_w) // 2, h + 12), label, fill=(0, 0, 0), font=font)
-        thumbs_with_time.append(canvas)
+        if duration == 0:
+            cap.release()
+            return jsonify({"error": "Invalid video file or zero duration"}), 400
 
-    # 拼接成矩阵
-    rows = math.ceil(len(thumbs_with_time) / thumbs_per_row)
-    thumb_h = thumbs_with_time[0].height if thumbs_with_time else 0
-    grid = Image.new("RGB", (thumb_width * thumbs_per_row, thumb_h * rows), (255, 255, 255))
-    for idx, thumb in enumerate(thumbs_with_time):
-        x = (idx % thumbs_per_row) * thumb_width
-        y = (idx // thumbs_per_row) * thumb_h
-        grid.paste(thumb, (x, y))
-    grid.save(out_path)
-    # 直接返回图片
-    return send_file(out_path, mimetype='image/jpeg')
+        thumbs = []
+        times = []
+        embs = []
+        t = 0
+        while t < duration:
+            logger.info(f"Processing time {t:.2f}s")
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ret, frame = cap.read()
+            if not ret:
+                break
+            img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(img)
+            w, h = pil_img.size
+            scale = thumb_width / w
+            thumb = pil_img.resize((thumb_width, int(h * scale)))
+            thumbs.append(thumb)
+            times.append(t)
+            # embedding
+            _, buf = cv2.imencode('.jpg', frame)
+            image_data = buf.tobytes()
+            emb = server.get_image_embedding(image_data, 'jpg')
+            embs.append(emb)
+            t += interval
+        cap.release()
+
+        if not thumbs:
+            return jsonify({"error": "No frames extracted from video"}), 400
+
+        # 突变帧检测，并记录每帧与上一个突变帧的相似度
+        mutation_idx = [0]
+        sim_to_last_mutation = [None]  # 第0帧无相似度
+        for i in range(1, len(embs)):
+            # 计算与所有突变帧的相似度
+            sims = [float(np.dot(embs[i], embs[m]) / (np.linalg.norm(embs[i]) * np.linalg.norm(embs[m]) + 1e-8)) for m in mutation_idx]
+            sim_to_last_mutation.append(sims[-1])  # 记录与最近突变帧的相似度
+            # 只有所有突变帧都不大于threshold才新增
+            if all(sim <= sim_threshold for sim in sims):
+                mutation_idx.append(i)
+
+        # 字体
+        try:
+            font = ImageFont.truetype(font_path or "arial.ttf", 18)
+            font_big = ImageFont.truetype(font_path or "arial.ttf", 26)
+        except:
+            font = ImageFont.load_default()
+            font_big = ImageFont.load_default()
+
+        thumbs_with_time = []
+        for idx, (thumb, t) in enumerate(zip(thumbs, times)):
+            w, h = thumb.size
+            canvas = Image.new("RGB", (w, h + 48), (255, 255, 255))
+            canvas.paste(thumb, (0, 0))
+            draw = ImageDraw.Draw(canvas)
+            time_str = "%02d:%02d:%02d" % (t // 3600, (t % 3600) // 60, t % 60)
+            # 取与最近突变帧的相似度
+            if idx == 0:
+                sim_str = "(N/A)"
+            else:
+                sim = sim_to_last_mutation[idx]
+                sim_str = f"({sim:.2f})"
+            label = f"{time_str}{sim_str}"
+            is_mutation = idx in mutation_idx
+            # 画红框
+            if is_mutation:
+                draw.rectangle([0, 0, w-1, h-1], outline=(255, 0, 0), width=6)
+            # 时间戳+相似度
+            if is_mutation:
+                bbox = draw.textbbox((0, 0), label, font=font_big)
+                text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                draw.text(((w - text_w) // 2, h + 2), label, fill=(255, 0, 0), font=font_big)
+            else:
+                bbox = draw.textbbox((0, 0), label, font=font)
+                text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                draw.text(((w - text_w) // 2, h + 12), label, fill=(0, 0, 0), font=font)
+            thumbs_with_time.append(canvas)
+
+        # 拼接成矩阵
+        rows = math.ceil(len(thumbs_with_time) / thumbs_per_row)
+        thumb_h = thumbs_with_time[0].height if thumbs_with_time else 0
+        grid = Image.new("RGB", (thumb_width * thumbs_per_row, thumb_h * rows), (255, 255, 255))
+        for idx, thumb in enumerate(thumbs_with_time):
+            x = (idx % thumbs_per_row) * thumb_width
+            y = (idx // thumbs_per_row) * thumb_h
+            grid.paste(thumb, (x, y))
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        grid.save(out_path)
+        
+        logger.info(f"Video extraction completed. Output saved to: {out_path}")
+        # 直接返回图片
+        return send_file(out_path, mimetype='image/jpeg')
+        
+    except Exception as e:
+        logger.error(f"Error processing video {video_path}: {e}")
+        return jsonify({"error": f"Error processing video: {str(e)}"}), 500
 
 if __name__ == "__main__":
     logger.info("Starting Image Search Server")

@@ -1,0 +1,1 @@
+docker run -it --name clip-server --rm -v $(pwd)/clip_server.py:/app/clip_server.py -v $(pwd)/index.html:/app/index.html -v $(pwd)/db:/app/db -v $(pwd)/pipe:/app/pipe -p 5000:5000 clip-server:latest

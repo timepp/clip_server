@@ -243,6 +243,21 @@
                     <div id="scanProgress" style="margin-top: 15px;"></div>
                 </div>
                 
+                <!-- File Browser Section -->
+                <div class="section">
+                    <h2>📂 File Browser</h2>
+                    <div class="form-group">
+                        <label for="fileFilter">Search Files by Name:</label>
+                        <input type="text" id="fileFilter" placeholder="Enter filename or part of filename (leave empty for all files)" />
+                    </div>
+                    <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 15px;">
+                        <button class="btn" onclick="browseFiles()">📋 Browse Files</button>
+                        <span id="fileCount" style="color: #666; font-size: 14px;"></span>
+                    </div>
+                    <div id="fileResults" class="results"></div>
+                    <div id="filePagination" style="margin-top: 15px; text-align: center;"></div>
+                </div>
+                
                 <div class="two-column">
                     <!-- Text Query Section -->
                     <div class="section">
@@ -372,6 +387,157 @@
                 }
             }
             
+            // Browse files with optional filtering
+            let currentFileOffset = 0;
+            const fileLimit = 20;
+            
+            async function browseFiles(offset = 0) {
+                const filter = document.getElementById('fileFilter').value.trim();
+                const resultsDiv = document.getElementById('fileResults');
+                const countDiv = document.getElementById('fileCount');
+                const paginationDiv = document.getElementById('filePagination');
+                
+                currentFileOffset = offset;
+                
+                resultsDiv.innerHTML = '<div class="loading">📋 Loading files...</div>';
+                countDiv.textContent = '';
+                paginationDiv.innerHTML = '';
+                
+                try {
+                    let url = `/files?limit=${fileLimit}&offset=${offset}`;
+                    if (filter) {
+                        url += `&filter=${encodeURIComponent(filter)}`;
+                    }
+                    
+                    const response = await fetch(url);
+                    const data = await response.json();
+                    
+                    if (data.error) {
+                        resultsDiv.innerHTML = `<div class="error">❌ ${data.error}</div>`;
+                        return;
+                    }
+                    
+                    // Update file count
+                    countDiv.textContent = `Found ${data.total_count} files`;
+                    if (filter) {
+                        countDiv.textContent += ` matching "${filter}"`;
+                    }
+                    
+                    // Display files
+                    displayFileResults(data.files, resultsDiv);
+                    
+                    // Display pagination
+                    displayFilePagination(data, paginationDiv);
+                    
+                } catch (error) {
+                    resultsDiv.innerHTML = `<div class="error">❌ Error: ${error.message}</div>`;
+                }
+            }
+            
+            // Display file results
+            function displayFileResults(files, container) {
+                if (!files || files.length === 0) {
+                    container.innerHTML = '<div class="loading">📭 No files found</div>';
+                    return;
+                }
+                
+                const html = files.map(file => {
+                    let typeIcon = '🖼️';
+                    let typeInfo = '';
+                    
+                    if (file.type === 'video_frame') {
+                        typeIcon = '🎬';
+                        typeInfo = `<p>🎥 Video: ${file.video_file}</p><p>⏰ Time: ${file.timestamp}</p>`;
+                    }
+                    
+                    return `
+                        <div class="result-item">
+                            <a href="/db/${file.key}" target="_blank">
+                                <img src="/db/${file.key}" alt="${file.key}" class="result-image" 
+                                     onerror="this.src='data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iODAiIGhlaWdodD0iODAiIHZpZXdCb3g9IjAgMCA4MCA4MCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHJlY3Qgd2lkdGg9IjgwIiBoZWlnaHQ9IjgwIiBmaWxsPSIjRjBGMEYwIi8+CjxwYXRoIGQ9Ik0yNCAzMkw0MCA0OEw1NiAzMiIgc3Ryb2tlPSIjOTk5OTk5IiBzdHJva2Utd2lkdGg9IjIiLz4KPC9zdmc+'" />
+                            </a>
+                            <div class="result-info">
+                                <h4>${typeIcon} ${file.key}</h4>
+                                <p>📏 Size: ${formatFileSize(file.imageSize)}</p>
+                                <p>📦 Source: ${file.source}</p>
+                                ${typeInfo}
+                            </div>
+                            <div style="display: flex; flex-direction: column; gap: 5px;">
+                                <button class="btn" style="padding: 8px 12px; font-size: 12px;" 
+                                        onclick="searchSimilarByKey('${file.key}')">🔍 Similar</button>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+                
+                container.innerHTML = html;
+            }
+            
+            // Display file pagination controls
+            function displayFilePagination(data, container) {
+                if (data.total_count <= fileLimit) {
+                    return; // No pagination needed
+                }
+                
+                const totalPages = Math.ceil(data.total_count / fileLimit);
+                const currentPage = Math.floor(data.offset / fileLimit) + 1;
+                
+                let paginationHtml = '<div style="display: flex; justify-content: center; align-items: center; gap: 10px;">';
+                
+                // Previous button
+                if (data.offset > 0) {
+                    paginationHtml += `<button class="btn" onclick="browseFiles(${data.offset - fileLimit})">← Previous</button>`;
+                }
+                
+                // Page info
+                paginationHtml += `<span style="color: #666;">Page ${currentPage} of ${totalPages}</span>`;
+                
+                // Next button
+                if (data.has_more) {
+                    paginationHtml += `<button class="btn" onclick="browseFiles(${data.offset + fileLimit})">Next →</button>`;
+                }
+                
+                paginationHtml += '</div>';
+                container.innerHTML = paginationHtml;
+            }
+            
+            // Search similar images by key
+            async function searchSimilarByKey(key) {
+                const resultsDiv = document.getElementById('similarResults');
+                const topK = document.getElementById('similarTopK').value || 5;
+                
+                // Clear the similar key input and set it to the clicked key
+                document.getElementById('similarKey').value = key;
+                
+                resultsDiv.innerHTML = '<div class="loading">🔍 Finding similar images...</div>';
+                
+                try {
+                    const formData = new FormData();
+                    formData.append('key', key);
+                    formData.append('top_k', topK);
+                    
+                    const response = await fetch('/similar', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.error) {
+                        resultsDiv.innerHTML = `<div class="error">❌ ${data.error}</div>`;
+                        return;
+                    }
+                    
+                    displayResults(data.results, resultsDiv);
+                    
+                    // Scroll to similar results section
+                    document.getElementById('similarResults').scrollIntoView({ behavior: 'smooth' });
+                    
+                } catch (error) {
+                    resultsDiv.innerHTML = `<div class="error">❌ Error: ${error.message}</div>`;
+                }
+            }
+            
             // Search similar images
             async function searchSimilar() {
                 const fileInput = document.getElementById('similarFile');
@@ -465,6 +631,16 @@
                         searchByText();
                     }
                 });
+                
+                // Allow Enter key for file search
+                document.getElementById('fileFilter').addEventListener('keypress', function(e) {
+                    if (e.key === 'Enter') {
+                        browseFiles(0);
+                    }
+                });
+                
+                // Load initial file list
+                browseFiles(0);
             });
         </script>
     </body>
