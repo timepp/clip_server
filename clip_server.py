@@ -53,17 +53,72 @@ class ImageSearchServer:
         return model, processor
 
     def get_image_embedding(self, image_data, image_type):
+        """
+        从图片数据生成embedding
+        返回: normalized embedding vector 或 None if failed
+        """
         try:
-            image = Image.open(BytesIO(image_data)).convert("RGB")
-            inputs = self.processor(images=image, return_tensors="pt").to(self.device)
-            with torch.no_grad():
-                embedding = self.model.get_image_features(**inputs)
-            embedding = embedding.cpu().numpy().flatten()
-            norm = np.linalg.norm(embedding)
-            return embedding / norm if norm > 0 else embedding
+            # 验证输入
+            if not image_data or len(image_data) == 0:
+                logger.error("Empty image data provided")
+                return None
+            
+            # 打开并转换图片
+            try:
+                image = Image.open(BytesIO(image_data)).convert("RGB")
+            except Exception as e:
+                logger.error(f"Failed to open/convert image: {e}")
+                return None
+            
+            # 检查图片尺寸
+            if image.size[0] == 0 or image.size[1] == 0:
+                logger.error("Invalid image dimensions")
+                return None
+            
+            # 处理图片
+            try:
+                inputs = self.processor(images=image, return_tensors="pt").to(self.device)
+            except Exception as e:
+                logger.error(f"Failed to process image with CLIP processor: {e}")
+                return None
+            
+            # 生成embedding
+            try:
+                with torch.no_grad():
+                    embedding = self.model.get_image_features(**inputs)
+            except Exception as e:
+                logger.error(f"Failed to generate image features: {e}")
+                return None
+            
+            # 转换为numpy并规范化
+            try:
+                embedding = embedding.cpu().numpy().flatten()
+                
+                # 检查embedding有效性
+                if len(embedding) != self.embedding_dim:
+                    logger.error(f"Embedding dimension mismatch: got {len(embedding)}, expected {self.embedding_dim}")
+                    return None
+                
+                # 检查是否包含NaN或inf
+                if not np.isfinite(embedding).all():
+                    logger.error("Embedding contains NaN or inf values")
+                    return None
+                
+                # 规范化
+                norm = np.linalg.norm(embedding)
+                if norm <= 1e-8:  # 避免除零
+                    logger.error("Embedding norm too small for normalization")
+                    return None
+                
+                return embedding / norm
+                
+            except Exception as e:
+                logger.error(f"Failed to process embedding tensor: {e}")
+                return None
+                
         except Exception as e:
-            logger.error(f"Error generating embedding: {e}")
-            raise
+            logger.error(f"Unexpected error generating embedding: {e}")
+            return None
 
     def get_text_embedding(self, text):
         inputs = self.processor(text=[text], return_tensors="pt", padding=True).to(self.device)
@@ -100,15 +155,59 @@ class ImageSearchServer:
         logger.info(f"Saved {len(embeddings)} embeddings to {self.embeddings_file}")
 
     def process_image(self, image_path, idx):
+        """
+        处理单个图片文件，生成embedding和metadata
+        返回: (idx, embedding, metadata) 或 (idx, None, None) 如果失败
+        """
         try:
-            with open(image_path, "rb") as f:
-                image_data = f.read()
-            embedding = self.get_image_embedding(image_data, os.path.splitext(image_path)[1].lower())
-            image_size = os.path.getsize(image_path)
+            # 检查文件是否存在
+            if not os.path.exists(image_path):
+                logger.warning(f"Image file not found: {image_path}")
+                return idx, None, None
+            
+            # 检查文件大小
+            file_size = os.path.getsize(image_path)
+            if file_size == 0:
+                logger.warning(f"Empty image file: {image_path}")
+                return idx, None, None
+            
+            # 读取文件
+            try:
+                with open(image_path, "rb") as f:
+                    image_data = f.read()
+            except (IOError, OSError) as e:
+                logger.error(f"Failed to read image file {image_path}: {e}")
+                return idx, None, None
+            
+            # 检查读取的数据
+            if not image_data:
+                logger.warning(f"No data read from image file: {image_path}")
+                return idx, None, None
+            
+            # 生成embedding
+            try:
+                embedding = self.get_image_embedding(image_data, os.path.splitext(image_path)[1].lower())
+            except Exception as e:
+                logger.error(f"Failed to generate embedding for {image_path}: {e}")
+                return idx, None, None
+            
+            # 验证embedding
+            if embedding is None or len(embedding) != self.embedding_dim:
+                logger.error(f"Invalid embedding generated for {image_path}")
+                return idx, None, None
+            
+            # 构建metadata
             rel_path = os.path.relpath(image_path, self.image_dir)
-            return idx, embedding, {"key": rel_path, "imageSize": image_size, "source": "db"}
+            metadata = {
+                "key": rel_path, 
+                "imageSize": file_size, 
+                "source": "db"
+            }
+            
+            return idx, embedding, metadata
+            
         except Exception as e:
-            logger.error(f"Error processing {image_path}: {e}")
+            logger.error(f"Unexpected error processing {image_path}: {e}")
             return idx, None, None
 
     def extract_video_frames(self, video_path, interval_sec=10, sim_threshold=0.95):
@@ -116,109 +215,455 @@ class ImageSearchServer:
         从视频每隔interval_sec抽取一帧，若与上一帧embedding相似度大于sim_threshold则跳过。
         返回：(key, embedding, metadata) 列表
         """
-        cap = cv2.VideoCapture(video_path)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = total_frames / fps if fps else 0
         results = []
-        prev_emb = None
-        prev_t = 0
-        t = 0
-        while t < duration:
-            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-            ret, frame = cap.read()
-            if not ret:
-                break
-            # 转为JPEG编码
-            _, buf = cv2.imencode('.jpg', frame)
-            image_data = buf.tobytes()
-            emb = self.get_image_embedding(image_data, 'jpg')
-            if prev_emb is not None:
-                sim = float(np.dot(emb, prev_emb) / (np.linalg.norm(emb) * np.linalg.norm(prev_emb) + 1e-8))
-                logger.info(f"Similarity between {prev_t} - {t}: {sim:.4f}")
-                if sim > sim_threshold:
+        cap = None
+        
+        try:
+            # 检查文件是否存在
+            if not os.path.exists(video_path):
+                logger.error(f"Video file not found: {video_path}")
+                return results
+            
+            # 检查文件大小
+            file_size = os.path.getsize(video_path)
+            if file_size == 0:
+                logger.error(f"Empty video file: {video_path}")
+                return results
+            
+            # 打开视频文件
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                logger.error(f"Failed to open video file: {video_path}")
+                return results
+            
+            # 获取视频信息
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            if fps <= 0:
+                logger.error(f"Invalid FPS ({fps}) for video: {video_path}")
+                return results
+            
+            if total_frames <= 0:
+                logger.error(f"Invalid frame count ({total_frames}) for video: {video_path}")
+                return results
+            
+            duration = total_frames / fps
+            logger.info(f"Processing video {video_path}: {duration:.1f}s, {fps:.1f}fps, {total_frames} frames")
+            
+            prev_emb = None
+            prev_t = 0
+            t = 0
+            frame_count = 0
+            error_count = 0
+            
+            while t < duration:
+                try:
+                    # 设置视频位置
+                    cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+                    ret, frame = cap.read()
+                    
+                    if not ret:
+                        logger.warning(f"Failed to read frame at {t:.1f}s in {video_path}")
+                        t += interval_sec
+                        error_count += 1
+                        if error_count > 10:  # 连续失败太多次就跳出
+                            logger.error(f"Too many frame read errors in {video_path}, stopping extraction")
+                            break
+                        continue
+                    
+                    # 检查帧是否有效
+                    if frame is None or frame.size == 0:
+                        logger.warning(f"Invalid frame at {t:.1f}s in {video_path}")
+                        t += interval_sec
+                        continue
+                    
+                    # 转为JPEG编码
+                    try:
+                        _, buf = cv2.imencode('.jpg', frame)
+                        if buf is None or len(buf) == 0:
+                            logger.warning(f"Failed to encode frame at {t:.1f}s in {video_path}")
+                            t += interval_sec
+                            continue
+                        image_data = buf.tobytes()
+                    except Exception as e:
+                        logger.error(f"Frame encoding error at {t:.1f}s in {video_path}: {e}")
+                        t += interval_sec
+                        continue
+                    
+                    # 生成embedding
+                    try:
+                        emb = self.get_image_embedding(image_data, 'jpg')
+                        if emb is None or len(emb) != self.embedding_dim:
+                            logger.warning(f"Invalid embedding at {t:.1f}s in {video_path}")
+                            t += interval_sec
+                            continue
+                    except Exception as e:
+                        logger.error(f"Embedding generation error at {t:.1f}s in {video_path}: {e}")
+                        t += interval_sec
+                        continue
+                    
+                    # 相似度检查
+                    if prev_emb is not None:
+                        try:
+                            sim = float(np.dot(emb, prev_emb) / (np.linalg.norm(emb) * np.linalg.norm(prev_emb) + 1e-8))
+                            logger.debug(f"Similarity between {prev_t:.1f}s - {t:.1f}s: {sim:.4f}")
+                            if sim > sim_threshold:
+                                t += interval_sec
+                                continue
+                        except Exception as e:
+                            logger.warning(f"Similarity calculation error at {t:.1f}s in {video_path}: {e}")
+                            # 继续处理，不跳过这一帧
+                    
+                    prev_emb = emb
+                    prev_t = t
+                    
+                    # 生成key和metadata
+                    try:
+                        h = int(t // 3600)
+                        m = int((t % 3600) // 60)
+                        s = int(t % 60)
+                        key = f"{os.path.relpath(video_path, self.image_dir)}>{h:02}:{m:02}:{s:02}"
+                        
+                        meta = {
+                            "key": key,
+                            "imageSize": len(image_data),
+                            "source": "db",
+                            "video_file": os.path.relpath(video_path, self.image_dir),
+                            "timestamp": f"{h:02}:{m:02}:{s:02}"
+                        }
+                        
+                        results.append((key, emb, meta))
+                        frame_count += 1
+                        
+                    except Exception as e:
+                        logger.error(f"Metadata creation error at {t:.1f}s in {video_path}: {e}")
+                    
                     t += interval_sec
-                    continue
-            prev_emb = emb
-            prev_t = t
-            # 生成key
-            h = int(t // 3600)
-            m = int((t % 3600) // 60)
-            s = int(t % 60)
-            key = f"{os.path.relpath(video_path, self.image_dir)}>{h:02}:{m:02}:{s:02}"
-            meta = {
-                "key": key,
-                "imageSize": len(image_data),
-                "source": "db",
-                "video_file": os.path.relpath(video_path, self.image_dir),
-                "timestamp": f"{h:02}:{m:02}:{s:02}"
-            }
-            results.append((key, emb, meta))
-            t += interval_sec
-        cap.release()
+                    
+                except Exception as e:
+                    logger.error(f"Frame processing error at {t:.1f}s in {video_path}: {e}")
+                    t += interval_sec
+                    error_count += 1
+                    
+                    if error_count > 20:  # 总错误太多就跳出
+                        logger.error(f"Too many errors processing {video_path}, stopping extraction")
+                        break
+            
+            logger.info(f"Extracted {frame_count} frames from {video_path} ({error_count} errors)")
+            
+        except Exception as e:
+            logger.error(f"Critical error processing video {video_path}: {e}")
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except:
+                    pass  # 忽略释放错误
+        
         return results
 
     def scan_directory(self, scan_videos=False):
         self.status["scanning"] = True
         self.status["last_scan_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
         logger.info("Starting directory scan")
-        valid_extensions = {".jpg", ".jpeg", ".png"}
-        if scan_videos:
-            valid_extensions.add(".mp4")
-        futures = []
-        embeddings = list(np.load(self.embeddings_file).astype(np.float32) if os.path.exists(self.embeddings_file) else [])
-        existing_keys = {item["key"] for item in self.metadata}
+        
+        try:
+            valid_extensions = {".jpg", ".jpeg", ".png"}
+            if scan_videos:
+                valid_extensions.add(".mp4")
+            futures = []
+            embeddings = list(np.load(self.embeddings_file).astype(np.float32) if os.path.exists(self.embeddings_file) else [])
+            existing_keys = {item["key"] for item in self.metadata}
 
-        # 删除source为'db'但文件已不存在的条目
-        to_delete = []
-        for i, meta in enumerate(self.metadata):
-            if meta.get("source") == "db":
-                file_path = os.path.join(self.image_dir, meta["key"].split('>')[0])
-                if not os.path.exists(file_path):
-                    to_delete.append(i)
-        for i in reversed(to_delete):
-            logger.info(f"Removing metadata and embedding for missing file: {self.metadata[i]['key']}")
-            del self.metadata[i]
-            if i < len(embeddings):
-                del embeddings[i]
-        self.save_metadata()
-        self.save_embeddings(embeddings)
-        self.index.reset()
-        if embeddings:
-            self.index.add(np.array(embeddings, dtype=np.float32))
-        self.status["image_count"] = len(self.metadata)
+            # 删除source为'db'但文件已不存在的条目
+            to_delete = []
+            for i, meta in enumerate(self.metadata):
+                if meta.get("source") == "db":
+                    file_path = os.path.join(self.image_dir, meta["key"].split('>')[0])
+                    if not os.path.exists(file_path):
+                        to_delete.append(i)
+            
+            if to_delete:
+                logger.info(f"Removing {len(to_delete)} entries for missing files")
+                for i in reversed(to_delete):
+                    logger.info(f"Removing metadata and embedding for missing file: {self.metadata[i]['key']}")
+                    del self.metadata[i]
+                    if i < len(embeddings):
+                        del embeddings[i]
+                self.save_metadata()
+                self.save_embeddings(embeddings)
+                self.index.reset()
+                if embeddings:
+                    self.index.add(np.array(embeddings, dtype=np.float32))
+                self.status["image_count"] = len(self.metadata)
 
-        # 新增：处理图片和（可选）视频
-        for root, _, files in os.walk(self.image_dir):
-            for file in files:
-                ext = os.path.splitext(file)[1].lower()
-                image_path = os.path.join(root, file)
-                rel_path = os.path.relpath(image_path, self.image_dir)
-                if ext in {".jpg", ".jpeg", ".png"}:
-                    if rel_path not in existing_keys:
-                        idx = len(self.metadata)
-                        futures.append(self.executor.submit(self.process_image, image_path, idx))
-                elif scan_videos and ext == ".mp4":
-                    # 视频帧抽取
+            # 先扫描所有文件，统计总数量
+            all_new_files = []
+            all_new_videos = []
+            
+            for root, _, files in os.walk(self.image_dir):
+                for file in files:
+                    ext = os.path.splitext(file)[1].lower()
+                    image_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(image_path, self.image_dir)
+                    
+                    if ext in {".jpg", ".jpeg", ".png"}:
+                        if rel_path not in existing_keys:
+                            all_new_files.append((image_path, rel_path))
+                    elif scan_videos and ext == ".mp4":
+                        all_new_videos.append((image_path, rel_path))
+
+            total_new_files = len(all_new_files)
+            total_new_videos = len(all_new_videos)
+            
+            logger.info(f"Found {total_new_files} new image files and {total_new_videos} new video files to process")
+            
+            # 存储扫描统计信息
+            self.status["scan_stats"] = {
+                "total_new_images": total_new_files,
+                "total_new_videos": total_new_videos,
+                "processed_images": 0,
+                "processed_videos": 0,
+                "failed_images": 0,
+                "failed_videos": 0,
+                "deleted_files": len(to_delete),  # 记录删除的文件数量
+                "added_files": 0  # 记录实际添加的文件数量
+            }
+
+            processed_count = 0
+            failed_count = 0
+
+            # 处理图片文件
+            for image_path, rel_path in all_new_files:
+                try:
+                    idx = len(self.metadata)
+                    futures.append(self.executor.submit(self.process_image, image_path, idx))
+                except Exception as e:
+                    logger.error(f"Failed to submit processing task for {rel_path}: {e}")
+                    failed_count += 1
+                    self.status["scan_stats"]["failed_images"] += 1
+
+            # 处理视频文件
+            for image_path, rel_path in all_new_videos:
+                try:
+                    logger.info(f"Processing video: {rel_path}")
                     video_results = self.extract_video_frames(image_path, interval_sec=2, sim_threshold=0.87)
+                    
+                    video_frame_count = 0
                     for key, emb, meta in video_results:
                         if key not in existing_keys:
-                            self.metadata.append(meta)
-                            embeddings.append(emb)
-                            self.status["image_count"] = len(self.metadata)
+                            try:
+                                self.metadata.append(meta)
+                                embeddings.append(emb)
+                                self.status["image_count"] = len(self.metadata)
+                                processed_count += 1
+                                video_frame_count += 1
+                                self.status["scan_stats"]["added_files"] += 1  # 记录添加的文件
+                                
+                                # Save every 5 frames to avoid data loss
+                                if processed_count % 5 == 0:
+                                    self.save_metadata()
+                                    self.save_embeddings(embeddings)
+                            except Exception as e:
+                                logger.error(f"Failed to add video frame {key}: {e}")
+                                failed_count += 1
+                    
+                    logger.info(f"Extracted {video_frame_count} frames from {rel_path}")
+                    self.status["scan_stats"]["processed_videos"] += 1
+                    
+                except Exception as e:
+                    logger.error(f"Failed to process video {rel_path}: {e}")
+                    failed_count += 1
+                    self.status["scan_stats"]["failed_videos"] += 1
+
+            # 处理图片任务的结果
+            successful_images = 0
+            for i, future in enumerate(tqdm(futures, desc="Processing images")):
+                try:
+                    idx, embedding, meta = future.result(timeout=30)  # 30秒超时
+                    if embedding is not None and meta is not None:
+                        self.metadata.append(meta)
+                        embeddings.append(embedding)
+                        self.status["image_count"] = len(self.metadata)
+                        processed_count += 1
+                        successful_images += 1
+                        self.status["scan_stats"]["processed_images"] += 1
+                        self.status["scan_stats"]["added_files"] += 1  # 记录添加的文件
+                        
+                        # Save periodically during processing
+                        if processed_count % 10 == 0:
                             self.save_metadata()
                             self.save_embeddings(embeddings)
-        if embeddings:
-            self.index.reset()
-            self.index.add(np.array(embeddings, dtype=np.float32))
-        self.status["scanning"] = False
-        logger.info("Directory scan completed")
+                    else:
+                        logger.warning(f"Image processing returned null result for task {i}")
+                        failed_count += 1
+                        self.status["scan_stats"]["failed_images"] += 1
+                        
+                except Exception as e:
+                    logger.error(f"Image processing task {i} failed: {e}")
+                    failed_count += 1
+                    self.status["scan_stats"]["failed_images"] += 1
+
+            # Final save
+            try:
+                if embeddings:
+                    self.index.reset()
+                    self.index.add(np.array(embeddings, dtype=np.float32))
+                    self.save_metadata()
+                    self.save_embeddings(embeddings)
+            except Exception as e:
+                logger.error(f"Failed to save final results: {e}")
+            
+            # 统计报告
+            total_attempted = total_new_files + sum(len(self.extract_video_frames(path, interval_sec=2, sim_threshold=0.87)) for path, _ in all_new_videos)
+            success_rate = (processed_count / total_attempted * 100) if total_attempted > 0 else 100
+            
+            # 获取统计数据
+            added_files = self.status["scan_stats"]["added_files"] if "scan_stats" in self.status else processed_count
+            deleted_files = self.status["scan_stats"]["deleted_files"] if "scan_stats" in self.status else len(to_delete) if 'to_delete' in locals() else 0
+            
+            logger.info(f"Directory scan completed:")
+            logger.info(f"  - Added {added_files} new items")
+            logger.info(f"  - Deleted {deleted_files} missing items")
+            logger.info(f"  - Failed to process {failed_count} items")
+            logger.info(f"  - Success rate: {success_rate:.1f}%")
+            logger.info(f"  - Total items in database: {len(self.metadata)}")
+            
+        except Exception as e:
+            logger.error(f"Critical error during directory scan: {e}")
+            raise
+        finally:
+            self.status["scanning"] = False
+            # 清理扫描统计信息
+            if "scan_stats" in self.status:
+                del self.status["scan_stats"]
 
     def generate_sse_progress(self):
-        # Placeholder for SSE progress (unchanged from original)
+        """Generate real-time SSE progress updates for directory scanning"""
         yield f"data: {json.dumps({'progress': 0, 'status': 'starting'})}\n\n"
-        time.sleep(1)
-        yield f"data: {json.dumps({'progress': 100, 'status': 'completed'})}\n\n"
+        
+        # Wait for scan to actually start
+        initial_wait = 0
+        while not self.status["scanning"] and initial_wait < 5:
+            time.sleep(0.1)
+            initial_wait += 0.1
+        
+        if not self.status["scanning"]:
+            yield f"data: {json.dumps({'progress': 100, 'status': 'failed to start'})}\n\n"
+            return
+        
+        yield f"data: {json.dumps({'progress': 5, 'status': 'scanning directory structure'})}\n\n"
+        
+        # Wait for scan stats to be available
+        stats_wait = 0
+        while self.status["scanning"] and "scan_stats" not in self.status and stats_wait < 10:
+            time.sleep(0.2)
+            stats_wait += 0.2
+        
+        if "scan_stats" in self.status:
+            stats = self.status["scan_stats"]
+            total_images = stats["total_new_images"]
+            total_videos = stats["total_new_videos"]
+            deleted_files = stats["deleted_files"]
+            
+            status_parts = []
+            if total_images > 0 or total_videos > 0:
+                status_parts.append(f"found {total_images} images, {total_videos} videos to process")
+            if deleted_files > 0:
+                status_parts.append(f"removed {deleted_files} missing files")
+            
+            if status_parts:
+                yield f"data: {json.dumps({'progress': 10, 'status': '; '.join(status_parts)})}\n\n"
+            else:
+                yield f"data: {json.dumps({'progress': 100, 'status': 'no new files to process'})}\n\n"
+                return
+        
+        # Monitor scanning progress
+        last_processed_images = 0
+        last_processed_videos = 0
+        scan_duration = 0
+        
+        while self.status["scanning"]:
+            time.sleep(0.8)
+            scan_duration += 0.8
+            
+            if "scan_stats" in self.status:
+                stats = self.status["scan_stats"]
+                processed_images = stats["processed_images"]
+                processed_videos = stats["processed_videos"]
+                failed_images = stats["failed_images"]
+                failed_videos = stats["failed_videos"]
+                total_images = stats["total_new_images"]
+                total_videos = stats["total_new_videos"]
+                added_files = stats["added_files"]
+                deleted_files = stats["deleted_files"]
+                
+                total_items = total_images + total_videos
+                processed_items = processed_images + processed_videos
+                failed_items = failed_images + failed_videos
+                
+                if total_items > 0:
+                    # Calculate progress based on actual completion
+                    progress = min(95, 10 + (processed_items + failed_items) / total_items * 85)
+                    
+                    # Create detailed status message
+                    status_parts = []
+                    if total_images > 0:
+                        status_parts.append(f"images: {processed_images}/{total_images}")
+                    if total_videos > 0:
+                        status_parts.append(f"videos: {processed_videos}/{total_videos}")
+                    if added_files > 0:
+                        status_parts.append(f"added: {added_files}")
+                    if deleted_files > 0:
+                        status_parts.append(f"deleted: {deleted_files}")
+                    if failed_items > 0:
+                        status_parts.append(f"failed: {failed_items}")
+                    
+                    status_msg = f"processing {', '.join(status_parts)}"
+                    
+                    yield f"data: {json.dumps({'progress': int(progress), 'status': status_msg})}\n\n"
+                    
+                    last_processed_images = processed_images
+                    last_processed_videos = processed_videos
+                else:
+                    # Fallback to time-based progress
+                    progress = min(80, 10 + (scan_duration * 1))
+                    yield f"data: {json.dumps({'progress': int(progress), 'status': 'processing files'})}\n\n"
+            else:
+                # No stats available, use time-based progress
+                progress = min(80, 10 + (scan_duration * 1))
+                yield f"data: {json.dumps({'progress': int(progress), 'status': 'processing files'})}\n\n"
+            
+            # Safety timeout after 120 seconds
+            if scan_duration > 120:
+                yield f"data: {json.dumps({'progress': 95, 'status': 'scan taking longer than expected'})}\n\n"
+                break
+        
+        # Final status
+        final_count = self.status["image_count"]
+        if "scan_stats" in self.status:
+            stats = self.status["scan_stats"]
+            added_files = stats["added_files"]
+            deleted_files = stats["deleted_files"]
+            failed_total = stats["failed_images"] + stats["failed_videos"]
+            
+            # 构建完成消息
+            status_parts = []
+            if added_files > 0:
+                status_parts.append(f"added {added_files}")
+            if deleted_files > 0:
+                status_parts.append(f"deleted {deleted_files}")
+            if failed_total > 0:
+                status_parts.append(f"failed {failed_total}")
+            
+            if status_parts:
+                change_summary = ", ".join(status_parts)
+                yield f"data: {json.dumps({'progress': 100, 'status': f'completed - {change_summary}, total: {final_count} images'})}\n\n"
+            else:
+                yield f"data: {json.dumps({'progress': 100, 'status': f'completed - no changes, total: {final_count} images'})}\n\n"
+        else:
+            yield f"data: {json.dumps({'progress': 100, 'status': f'completed - {final_count} images total'})}\n\n"
 
 @app.route("/index.html", methods=["GET"])
 def serve_index():

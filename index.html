@@ -239,6 +239,12 @@
                 <div class="section">
                     <h2>📁 Scan Directory</h2>
                     <p style="margin-bottom: 15px; color: #666;">Scan the ./db directory for new images and generate embeddings.</p>
+                    <div style="margin-bottom: 15px;">
+                        <label style="display: flex; align-items: center; gap: 8px; color: #555;">
+                            <input type="checkbox" id="scanVideos" style="transform: scale(1.2);">
+                            <span>🎬 Include video processing (extract frames)</span>
+                        </label>
+                    </div>
                     <button class="btn" id="scanBtn" onclick="scanDirectory()">🔍 Start Scan</button>
                     <div id="scanProgress" style="margin-top: 15px;"></div>
                 </div>
@@ -321,14 +327,27 @@
             async function scanDirectory() {
                 const scanBtn = document.getElementById('scanBtn');
                 const progressDiv = document.getElementById('scanProgress');
+                const scanVideos = document.getElementById('scanVideos').checked;
                 
                 scanBtn.disabled = true;
                 scanBtn.textContent = '🔄 Scanning...';
                 progressDiv.innerHTML = '<div class="loading">📊 Scanning directory...</div>';
                 
                 try {
-                    const response = await fetch('/scandir');
+                    let url = '/scandir';
+                    if (scanVideos) {
+                        url += '?scan_videos=true';
+                    }
+                    
+                    const response = await fetch(url);
+                    
+                    if (!response.ok) {
+                        const errorData = await response.json();
+                        throw new Error(errorData.error || 'Scan request failed');
+                    }
+                    
                     const reader = response.body.getReader();
+                    let lastProgress = 0;
                     
                     while (true) {
                         const { done, value } = await reader.read();
@@ -339,20 +358,32 @@
                         
                         for (const line of lines) {
                             if (line.startsWith('data: ')) {
-                                const data = JSON.parse(line.substring(6));
-                                progressDiv.innerHTML = `
-                                    <div class="status">
-                                        📊 Progress: ${data.progress}% - ${data.status}
-                                    </div>
-                                `;
+                                try {
+                                    const data = JSON.parse(line.substring(6));
+                                    lastProgress = data.progress;
+                                    progressDiv.innerHTML = `
+                                        <div class="status">
+                                            📊 Progress: ${data.progress}% - ${data.status}
+                                        </div>
+                                    `;
+                                } catch (parseError) {
+                                    console.log('Failed to parse SSE data:', line);
+                                }
                             }
                         }
                     }
                     
-                    progressDiv.innerHTML = '<div class="status">✅ Scan completed successfully!</div>';
-                    updateStatus();
+                    // Ensure we show completion
+                    if (lastProgress < 100) {
+                        progressDiv.innerHTML = '<div class="status">✅ Scan completed successfully!</div>';
+                    }
+                    
+                    // Update status after scan
+                    setTimeout(updateStatus, 1000);
+                    
                 } catch (error) {
                     progressDiv.innerHTML = `<div class="error">❌ Error: ${error.message}</div>`;
+                    console.error('Scan error:', error);
                 } finally {
                     scanBtn.disabled = false;
                     scanBtn.textContent = '🔍 Start Scan';
