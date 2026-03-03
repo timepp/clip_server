@@ -24,14 +24,15 @@ COPY download_model.py .
 RUN python download_model.py
 
 # Copy application files
-COPY clip_server.py .
-COPY index.html .
+# COPY clip-server.py .
+# COPY index.html .
+COPY clip-service.py .
 
 # Create db directory for images
-RUN mkdir -p /app/db
+# RUN mkdir -p /app/db
 
 # Clean up download script (optional)
 RUN rm download_model.py
 
 EXPOSE 5000
-CMD ["python", "clip_server.py"]
+CMD ["python", "clip-service.py"]
