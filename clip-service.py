@@ -213,14 +213,20 @@ def add_embeddings():
         if not isinstance(data, list):
             return jsonify({"error": "'embeddings' must be a list of base64 strings"}), 400
         added = 0
+        normalized_list = []
         for emb_b64 in data:
             if not isinstance(emb_b64, str):
                 continue
             arr = base64_to_embedding(emb_b64)
             if len(arr) == embedding_dim:
-                embeddings.append(normalize_embedding(arr))
+                # normed = normalize_embedding(arr)
+                normed = arr
+                index = len(embeddings)
+                embeddings.append(normed)
                 added += 1
-        return jsonify({"added": added, "count": len(embeddings)}), 200
+                if not np.array_equal(arr, normed):
+                    normalized_list.append({"index": index, "embedding": embedding_to_base64(normed)})
+        return jsonify({"added": added, "count": len(embeddings), "normalized": normalized_list}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
